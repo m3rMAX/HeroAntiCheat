@@ -1,0 +1,198 @@
+package com.sawelife.heroac;
+
+import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
+import org.bukkit.Location;
+import org.bukkit.Particle;
+import org.bukkit.Sound;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityResurrectEvent;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.player.PlayerExpChangeEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerRegisterChannelEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.scheduler.BukkitTask;
+
+import java.util.*;
+
+public final class HeroAntiCheat extends JavaPlugin implements Listener {
+    private final Map<UUID, FlightTrack> flight = new HashMap<>();
+    private final Map<UUID, Deque<XpGain>> xp = new HashMap<>();
+    private final Map<UUID, Integer> totemTickCount = new HashMap<>();
+    private final Map<UUID, Long> totemTick = new HashMap<>();
+    private final Map<UUID, AimTrack> aim = new HashMap<>();
+    private final Map<UUID, BukkitTask> frozen = new HashMap<>();
+    private final Map<UUID, Set<String>> clientChannels = new HashMap<>();
+
+    @Override public void onEnable() {
+        saveDefaultConfig();
+        getServer().getPluginManager().registerEvents(this, this);
+        getLogger().info("Hero AntiCheat enabled. Server-side heuristics have limitations; Freecam and aim-assist cannot be proven by these checks alone.");
+    }
+    @Override public void onDisable() { for (BukkitTask t : frozen.values()) t.cancel(); clearMaps(); }
+    private void clearMaps() { flight.clear(); xp.clear(); totemTickCount.clear(); totemTick.clear(); aim.clear(); frozen.clear(); }
+    private boolean exempt(Player p) {
+        return p.isOp() || p.hasPermission("heroac.bypass") || p.getGameMode()==GameMode.CREATIVE
+            || p.getGameMode()==GameMode.SPECTATOR;
+    }
+    private void alert(Player p, String reason) {
+        if (!getConfig().getBoolean("alerts", true)) return;
+        String msg="§8[§cHero AntiCheat§8] §f"+p.getName()+" §7اشتباه: §c"+reason;
+        for (Player online:Bukkit.getOnlinePlayers()) if (online.hasPermission("heroac.admin")) online.sendMessage(msg);
+        getLogger().warning(p.getName()+" suspicious: "+reason);
+    }
+    private void banDays(Player p, String reason) {
+        int min=Math.max(1,getConfig().getInt("punishments.temporary-ban-min-days",2));
+        int max=Math.max(min,getConfig().getInt("punishments.temporary-ban-max-days",7));
+        int days=min + new Random().nextInt(max-min+1);
+        alert(p,reason+" ("+days+" day temporary ban)");
+        // Uses EssentialsX /bantemp when installed; fallback to vanilla /ban is permanent.
+        // Prefer LiteBans or AdvancedBan for true timed bans. Never silently use permanent ban as fallback.
+        if (Bukkit.getPluginManager().getPlugin("LiteBans")!=null) {
+            Bukkit.dispatchCommand(Bukkit.getConsoleSender(),"tempban "+p.getName()+" "+days+"d Hero_AntiCheat_"+reason.replace(' ','_'));
+        } else if (Bukkit.getPluginManager().getPlugin("AdvancedBan")!=null) {
+            Bukkit.dispatchCommand(Bukkit.getConsoleSender(),"tempban "+p.getName()+" "+days+"d Hero AntiCheat: "+reason);
+        } else {
+            p.kickPlayer("§cHero AntiCheat\n§fتم حظرك مؤقتًا لمدة "+days+" يوم.\n§7السبب: "+reason+"\n§eيلزم تثبيت LiteBans أو AdvancedBan لتطبيق مدة الحظر تلقائيًا.");
+            getLogger().warning("Timed ban requested but LiteBans/AdvancedBan not found; no permanent ban was issued.");
+        }
+    }
+    private void freezeForXp(Player p) {
+        UUID id=p.getUniqueId();
+        BukkitTask old=frozen.remove(id); if(old!=null) old.cancel();
+        int seconds=Math.max(1,getConfig().getInt("punishments.fast-xp-freeze-seconds",8));
+        Location anchor=p.getLocation().clone();
+        p.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS,seconds*20,10,false,false,true));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.JUMP_BOOST,seconds*20,128,false,false,true));
+        p.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING,seconds*20,0,false,false,true));
+        p.sendTitle("§c§lهــاكــر؟","§cHero AntiCheat §7- Fast XP",5,seconds*20,5);
+        p.sendMessage("§cتم إيقاف حركتك مؤقتًا للاشتباه في Fast XP. إذا كان هذا خطأ، تواصل مع الإدارة.");
+        BukkitTask task=Bukkit.getScheduler().runTaskTimer(this, new Runnable() {
+            int ticks=0;
+            @Override public void run() {
+                if(!p.isOnline() || ticks++ >= seconds*20) {
+                    BukkitTask self=frozen.remove(id); if(self!=null) self.cancel();
+                    if(p.isOnline()) {
+                        p.removePotionEffect(PotionEffectType.SLOWNESS);
+                        p.removePotionEffect(PotionEffectType.JUMP_BOOST);
+                        p.removePotionEffect(PotionEffectType.GLOWING);
+                        p.kickPlayer(getConfig().getString("messages.xp-kick","§cتم طردك بواسطة Hero AntiCheat بسبب استخدام Fast XP."));
+                    }
+                    return;
+                }
+                Location now=p.getLocation();
+                if(now.getWorld()==anchor.getWorld() && now.distanceSquared(anchor)>0.05) {
+                    Location hold=anchor.clone(); hold.setYaw(now.getYaw()); hold.setPitch(now.getPitch()); p.teleport(hold);
+                }
+                p.getWorld().spawnParticle(Particle.DUST, p.getLocation().add(0,1,0), 24, .45,.7,.45, 0,
+                    new Particle.DustOptions(org.bukkit.Color.RED,1.8f));
+                if(ticks%20==0) p.playSound(p.getLocation(),Sound.BLOCK_NOTE_BLOCK_BASS,.5f,.7f);
+            }
+        },0L,1L);
+        frozen.put(id,task);
+    }
+    // Best-effort client metadata check. Most Freecam mods do not announce their name to the server.
+    @EventHandler public void onJoin(PlayerJoinEvent e) {
+        Player p=e.getPlayer();
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!p.isOnline() || exempt(p) || !getConfig().getBoolean("checks.client-mod-signal.enabled", true)) return;
+            String brand=p.getClientBrandName();
+            if (brand == null) return;
+            String lower=brand.toLowerCase(Locale.ROOT);
+            for (String token : getConfig().getStringList("checks.client-mod-signal.brand-denylist")) {
+                if (!token.isBlank() && lower.contains(token.toLowerCase(Locale.ROOT))) {
+                    banDays(p, "Client brand signal: " + token);
+                    return;
+                }
+            }
+        }, 10L);
+    }
+
+    @EventHandler public void onRegisterChannel(PlayerRegisterChannelEvent e) {
+        String channel=e.getChannel().toLowerCase(Locale.ROOT);
+        clientChannels.computeIfAbsent(e.getPlayer().getUniqueId(), k -> new HashSet<>()).add(channel);
+        if (exempt(e.getPlayer()) || !getConfig().getBoolean("checks.client-mod-signal.enabled", true)) return;
+        for (String token : getConfig().getStringList("checks.client-mod-signal.channel-denylist")) {
+            if (!token.isBlank() && channel.contains(token.toLowerCase(Locale.ROOT))) {
+                banDays(e.getPlayer(), "Client channel signal: " + token);
+                return;
+            }
+        }
+    }
+
+    @EventHandler public void onMove(PlayerMoveEvent e) {
+        Player p=e.getPlayer();
+        if(frozen.containsKey(p.getUniqueId())) {
+            Location from=e.getFrom(), to=e.getTo();
+            if(to!=null && (Math.abs(from.getX()-to.getX())>.01 || Math.abs(from.getY()-to.getY())>.01 || Math.abs(from.getZ()-to.getZ())>.01)) {
+                Location hold=from.clone(); hold.setYaw(to.getYaw()); hold.setPitch(to.getPitch()); e.setTo(hold);
+            }
+            return;
+        }
+        if(exempt(p) || e.getTo()==null || e.getFrom().getWorld()!=e.getTo().getWorld()) { flight.remove(p.getUniqueId()); return; }
+        if(p.isFlying()||p.isGliding()||p.isInsideVehicle()||p.isSwimming()||p.isClimbing()||p.isInWater()||p.isInLava()
+          ||p.hasPotionEffect(PotionEffectType.LEVITATION)||p.hasPotionEffect(PotionEffectType.SLOW_FALLING)) { flight.remove(p.getUniqueId()); return; }
+        double dy=e.getTo().getY()-e.getFrom().getY();
+        if(dy<=.02 || p.isOnGround()) { FlightTrack t=flight.get(p.getUniqueId()); if(t!=null){t.samples=Math.max(0,t.samples-2);if(t.samples==0)flight.remove(p.getUniqueId());} return; }
+        FlightTrack t=flight.computeIfAbsent(p.getUniqueId(),k->new FlightTrack(e.getFrom().clone())); t.samples++;
+        if(t.samples>=getConfig().getInt("checks.flight.samples-to-flag",12)
+          && e.getTo().getY()-t.start.getY()>=getConfig().getDouble("checks.flight.min-upward-blocks",2.2)) {
+            banDays(p,"Unauthorized Flight"); flight.remove(p.getUniqueId());
+        }
+    }
+    @EventHandler public void onXp(PlayerExpChangeEvent e) {
+        Player p=e.getPlayer(); if(exempt(p)||e.getAmount()<=0||!getConfig().getBoolean("checks.fast-xp.enabled",true))return;
+        long now=System.currentTimeMillis(); Deque<XpGain> q=xp.computeIfAbsent(p.getUniqueId(),k->new ArrayDeque<>());
+        q.addLast(new XpGain(now,e.getAmount())); long window=getConfig().getLong("punishments.fast-xp-window-seconds",3)*1000L;
+        while(!q.isEmpty()&&now-q.peekFirst().time>window)q.removeFirst();
+        if(q.stream().mapToInt(a->a.amount).sum()>=getConfig().getInt("punishments.fast-xp-points-per-window",120)) {
+            alert(p,"Suspicious Fast XP"); q.clear(); freezeForXp(p);
+        }
+    }
+    @EventHandler public void onTotem(EntityResurrectEvent e) {
+        if(!(e.getEntity() instanceof Player p)||exempt(p))return;
+        UUID id=p.getUniqueId(); long tick=Bukkit.getCurrentTick();
+        if(!Objects.equals(totemTick.get(id),tick)){totemTick.put(id,tick);totemTickCount.put(id,0);}
+        int count=totemTickCount.merge(id,1,Integer::sum);
+        if(count>=getConfig().getInt("checks.totem.same-tick-pops-to-flag",2)) banDays(p,"Totem Abuse");
+    }
+    @EventHandler public void onDamage(EntityDamageByEntityEvent e) {
+        if(!(e.getDamager() instanceof Player p)||!(e.getEntity() instanceof LivingEntity target)||exempt(p)
+           ||!getConfig().getBoolean("checks.aim.enabled",true))return;
+        long now=System.currentTimeMillis(); AimTrack t=aim.computeIfAbsent(p.getUniqueId(),k->new AimTrack());
+        while(!t.hits.isEmpty()&&now-t.hits.peekFirst().time>getConfig().getLong("checks.aim.window-seconds",10)*1000L)t.hits.removeFirst();
+        UUID targetId=target.getUniqueId();
+        if(t.lastTarget!=null&&!t.lastTarget.equals(targetId)) t.switches++;
+        t.lastTarget=targetId; t.hits.addLast(new Hit(now,targetId));
+        // A target-switch counter is only a weak heuristic; it does not establish that aim assist is present.
+        if(t.switches>=getConfig().getInt("checks.aim.suspicious-switches-to-flag",8)) {
+            alert(p,"Suspicious Aim Target Switching"); banDays(p,"Aim Assist Suspicion"); aim.remove(p.getUniqueId());
+        }
+    }
+    @EventHandler public void onQuit(PlayerQuitEvent e) {
+        UUID id=e.getPlayer().getUniqueId(); flight.remove(id);xp.remove(id);totemTickCount.remove(id);totemTick.remove(id);aim.remove(id);clientChannels.remove(id);
+        BukkitTask task=frozen.remove(id); if(task!=null)task.cancel();
+    }
+    @Override public boolean onCommand(CommandSender sender,Command command,String label,String[] args) {
+        if(!sender.hasPermission("heroac.admin")){sender.sendMessage("§cليس لديك صلاحية.");return true;}
+        if(args.length==1&&args[0].equalsIgnoreCase("reload")){reloadConfig();sender.sendMessage("§aتم إعادة تحميل Hero AntiCheat.");return true;}
+        sender.sendMessage("§eاستخدم: /heroac reload");return true;
+    }
+    private static final class FlightTrack {final Location start;int samples;FlightTrack(Location l){start=l;}}
+    private record XpGain(long time,int amount){}
+    private record Hit(long time,UUID target){}
+    private static final class AimTrack {UUID lastTarget;int switches;final Deque<Hit> hits=new ArrayDeque<>();}
+}

@@ -1,0 +1,16 @@
+name: HeroAntiCheat
+version: 1.0.0
+main: com.sawelife.heroac.HeroAntiCheat
+api-version: '1.21'
+author: SAWE LIFE
+description: Heuristic anti-cheat checks for Paper/Purpur
+commands:
+  heroac:
+    description: Hero AntiCheat administration
+    usage: /heroac reload
+    permission: heroac.admin
+permissions:
+  heroac.admin:
+    default: op
+  heroac.bypass:
+    default: false

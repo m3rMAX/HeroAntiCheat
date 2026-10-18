@@ -1,0 +1,35 @@
+# Hero AntiCheat - test thresholds before enabling bans on a live server.
+alerts: true
+punishments:
+  # For detected aim-assist/flight/totem violations: randomized duration between min and max days.
+  temporary-ban-min-days: 2
+  temporary-ban-max-days: 7
+  # Kick on suspicious XP gain; player is temporarily immobilized and marked with red particles first.
+  fast-xp-freeze-seconds: 8
+  fast-xp-points-per-window: 120
+  fast-xp-window-seconds: 3
+  # Freecam cannot be reliably detected by server-side events. Do not enable automatic ban based on this guess.
+  freecam-ban-enabled: false
+checks:
+  flight:
+    samples-to-flag: 12
+    min-upward-blocks: 2.2
+  aim:
+    enabled: true
+    # Conservative heuristic: repeated sharp target switches while hitting entities.
+    suspicious-switches-to-flag: 8
+    window-seconds: 10
+  totem:
+    same-tick-pops-to-flag: 2
+  fast-xp:
+    enabled: true
+  client-mod-signal:
+    enabled: true
+    # Only detects names explicitly exposed by client brand/channel metadata; most Freecam mods do not expose themselves.
+    # Keep lists empty unless you have verified the signal from your own client logs.
+    brand-denylist: []
+    channel-denylist: []
+messages:
+  xp-kick: "&cتم طردك بواسطة Hero AntiCheat بسبب استخدام Fast XP."
+  freecam-kick: "&cتم طردك بواسطة Hero AntiCheat بسبب الاشتباه في Freecam."
+  ban-reason: "Hero AntiCheat: %reason%"
